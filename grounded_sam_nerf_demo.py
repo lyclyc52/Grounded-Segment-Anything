@@ -1,7 +1,7 @@
 import argparse
 import os
 import copy
-from tqdm import tqdm
+
 import numpy as np
 import json
 import torch
@@ -126,11 +126,7 @@ def save_mask_data(output_dir, mask_list, box_list, label_list):
         })
     with open(os.path.join(output_dir, 'mask.json'), 'w') as f:
         json.dump(json_data, f)
-        
-        
-def path_name(path):
-    head, tail = os.path.split(path)
-    return tail or os.path.basename(head)
+    
 
 if __name__ == "__main__":
 
@@ -142,8 +138,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sam_checkpoint", type=str, required=True, help="path to checkpoint file"
     )
-    parser.add_argument("--input_image", type=str, default=None, help="path to image file")
-    parser.add_argument("--input_json_root", type=str, default=None, help="path to json file")
+    parser.add_argument("--input_image", type=str, required=True, help="path to image file")
+    parser.add_argument("--input_feature", type=str, required=True, help='path to feature file')
+    parser.add_argument("--text_prompt", type=str, required=True, help="text prompt")
     parser.add_argument(
         "--output_dir", "-o", type=str, default="outputs", required=True, help="output directory"
     )
@@ -156,53 +153,76 @@ if __name__ == "__main__":
 
     # cfg
     config_file = args.config  # change the path of the model config file
+    grounded_checkpoint = args.grounded_checkpoint  # change the path of the model
     sam_checkpoint = args.sam_checkpoint
+    image_path = args.input_image
+    text_prompt = args.text_prompt
     output_dir = args.output_dir
+    box_threshold = args.box_threshold
+    text_threshold = args.text_threshold
     device = args.device
 
-    if args.input_json_root is not None:
-        json_file = os.path.join(args.input_json_root, 'transforms.json')
-        with open(json_file) as f:
-            data = json.load(f)['frames']
-        # json_file = os.path.join(args.input_json_root, 'transforms_test.json')
-        # with open(json_file) as f:
-        #     data.extend(json.load(f)['frames'])
-        os.makedirs(output_dir, exist_ok=True)
+    # make dir
+    os.makedirs(output_dir, exist_ok=True)
+    # load image
+    image_pil, image = load_image(image_path)
+    # load model
+    model = load_model(config_file, grounded_checkpoint, device=device)
 
-        # initialize SAM
-        predictor = SamPredictor(build_sam(checkpoint=sam_checkpoint).to(device))
-        for f in tqdm(data):
-            image_path = os.path.join(args.input_json_root, f['file_path'])
-            image_name = path_name(image_path)
-            outfile = os.path.join(output_dir, image_name.replace('png', 'npz').replace('jpg', 'npz'))
-            # load image
-            image_pil, image = load_image(image_path)
-            image = cv2.imread(image_path)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            predictor.set_image(image)
-            embedding = predictor.get_image_embedding()
-            embedding = embedding.cpu().numpy()[0]
-            
-            res = np.array(embedding.shape)
-            embedding = embedding.reshape(-1)
-            np.savez(outfile, res=res, embedding=embedding)
-                
-    else:
-        # make dir
-        image_path = args.input_image
-        os.makedirs(output_dir, exist_ok=True)
-        image_name = path_name(image_path)
-        outfile = os.path.join(output_dir, image_name.replace('png', 'npz'))
-        # load image
-        image_pil, image = load_image(image_path)
-        # initialize SAM
-        predictor = SamPredictor(build_sam(checkpoint=sam_checkpoint).to(device))
-        image = cv2.imread(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        predictor.set_image(image)
-        embedding = predictor.get_image_embedding()
-        embedding = embedding.cpu().numpy()[0]
-        
-        res = np.array(embedding.shape)
-        embedding = embedding.reshape([res[0], -1])
-        np.savez(outfile, res=res, embedding=embedding)
+    # visualize raw image
+    image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
+
+    # run grounding dino model
+    boxes_filt, pred_phrases = get_grounding_output(
+        model, image, text_prompt, box_threshold, text_threshold, device=device
+    )
+
+    # initialize SAM
+    
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    f_path = args.input_feature
+    with np.load(f_path) as data:
+        res = data['res']
+        feature = data['embedding']
+        feature = feature.reshape(res.tolist())
+        # feature = feature.transpose(2, 0, 1)
+    print(feature.shape)
+    predictor = SamPredictor(build_sam(checkpoint=sam_checkpoint).to(device))
+    predictor.set_image(image)
+    predictor.set_torch_feature(feature)
+    
+    size = image_pil.size
+    H, W = size[1], size[0]
+    for i in range(boxes_filt.size(0)):
+        boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
+        boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
+        boxes_filt[i][2:] += boxes_filt[i][:2]
+
+    boxes_filt = boxes_filt.cpu()
+    transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
+
+    masks, _, _ = predictor.predict_torch(
+        point_coords = None,
+        point_labels = None,
+        boxes = transformed_boxes.to(device),
+        multimask_output = False,
+    )
+    
+    # draw output image
+    plt.figure(figsize=(10, 10))
+    plt.imshow(image)
+    for mask in masks:
+        show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
+    for box, label in zip(boxes_filt, pred_phrases):
+        show_box(box.numpy(), plt.gca(), label)
+
+    plt.axis('off')
+    plt.savefig(
+        os.path.join(output_dir, "grounded_sam_output.jpg"), 
+        bbox_inches="tight", dpi=300, pad_inches=0.0
+    )
+
+    save_mask_data(output_dir, masks, boxes_filt, pred_phrases)
+

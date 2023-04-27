@@ -6,10 +6,11 @@
 
 import numpy as np
 import torch
-
+import torch.nn.functional as F
 from segment_anything.modeling import Sam
 
 from typing import Optional, Tuple
+import cv2
 
 from .utils.transforms import ResizeLongestSide
 
@@ -88,7 +89,29 @@ class SamPredictor:
         input_image = self.model.preprocess(transformed_image)
         self.features = self.model.image_encoder(input_image)
         self.is_image_set = True
+        
+    @torch.no_grad()
+    def set_torch_feature(
+        self,
+        features: np.ndarray,
+    ) -> None:
+      target_feature_size = self.model.image_encoder.img_size // self.model.image_encoder.patch_size
+      if features.shape[1] != target_feature_size or features.shape[2] != target_feature_size:
+        f_h, f_w = features.shape[1:]
+        max_length = max(f_h, f_w)
+        h,w = int(np.floor(target_feature_size * f_h / max_length)), int(np.floor(target_feature_size * f_w / max_length))
+        features = cv2.resize(features.transpose(1,2,0), (w,h), interpolation = cv2.INTER_NEAREST )
+        features = features.transpose(2,0,1)
+        features = torch.from_numpy(features[None,...]).to(self.device)
+        
+        padh = target_feature_size - h
+        padw = target_feature_size - w
+        self.features = F.pad(features, (0, padw, 0, padh))
+      else:
+        self.features = torch.from_numpy(features[None,...]).to(self.device)
 
+        
+        
     def predict(
         self,
         point_coords: Optional[np.ndarray] = None,
